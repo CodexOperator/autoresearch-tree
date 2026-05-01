@@ -34,6 +34,31 @@ PLUGIN_ROOT = Path(__file__).resolve().parent.parent  # extensions/autoresearch-
 ZOOM_PY = PLUGIN_ROOT / "bin" / "zoom.py"
 CLI_PY = PLUGIN_ROOT / "bin" / "cli.py"
 
+# Env vars Claude Code injects so its own agent can use the user's Anthropic
+# subscription (Token Plan). If pi inherits these, every spawned subagent
+# silently consumes that same quota and competes with the interactive CC
+# session for it. Scrub them so pi falls back to its own configured provider
+# (typically minimax via ~/.pi/agent/settings.json).
+ENV_VARS_TO_SCRUB = (
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_AUTH_TOKEN",
+    "ANTHROPIC_MODEL",
+    "CLAUDE_CODE_PROVIDER_MANAGED_BY_HOST",
+    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC",
+    "CLAUDE_CODE_EMIT_TOOL_USE_SUMMARIES",
+    "CLAUDE_CODE_ENABLE_ASK_USER_QUESTION_TOOL",
+    "CLAUDE_CODE_DISABLE_CRON",
+    "CLAUDE_AGENT_SDK_VERSION",
+    "CLAUDECODE",
+)
+
+
+def _scrubbed_env() -> dict[str, str]:
+    """Inherited env minus Claude-Code-injected Anthropic credentials."""
+    env = {k: v for k, v in os.environ.items() if k not in ENV_VARS_TO_SCRUB}
+    return env
+
 
 def main() -> int:
     ap = argparse.ArgumentParser()
@@ -93,6 +118,7 @@ def main() -> int:
                 stdin=subprocess.DEVNULL,
                 start_new_session=True,
                 cwd=str(root),
+                env=_scrubbed_env(),
             )
         agent_record = {
             "id": agent_id,
