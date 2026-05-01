@@ -66,7 +66,7 @@ def cmd_done(args: argparse.Namespace) -> int:
     if args.node_id:
         node_file = _find_node_file(root, args.node_id)
         if node_file and node_file.exists():
-            _append_verdict_to_node(node_file, args.verdict, args.confidence, args.notes)
+            _append_verdict_to_node(node_file, args.verdict, args.confidence, args.notes, args.next_edge)
             print(f"updated verdict in: {node_file}")
         else:
             # Fallback: write verdict node
@@ -80,6 +80,7 @@ def cmd_done(args: argparse.Namespace) -> int:
                 "type: verdict",
                 f"verdict: {args.verdict}",
                 f"confidence: {args.confidence}",
+                f"next_edges: [{args.next_edge}]" if args.next_edge else "next_edges: []",
             ]
             if args.parent:
                 fm_lines.append(f"parents:\n  - {args.parent}")
@@ -168,25 +169,155 @@ def cmd_scaffold(args: argparse.Namespace) -> int:
 
 
 def _find_node_file(root: Path, node_id: str) -> Path | None:
-    """Find a node file by its canonical id (type:slug or type/slug)."""
-    # node_id like "experiment:foo-r1" or just "foo-r1"
+    """Find a node file by its canonical id. Tries path heuristic then frontmatter scan."""
     parts = node_id.split(":", 1)
     if len(parts) == 2:
         ntype, slug = parts
     else:
         return None
     type_dir = ntype.replace("-", "_")
-    f = root / "nodes" / type_dir / f"{slug}.md"
-    if f.exists():
-        return f
-    # Try hyphenated
-    f2 = root / "nodes" / ntype / f"{slug}.md"
-    if f2.exists():
-        return f2
+
+    # Try direct path first (simple slug case)
+    for ndir in [root / "nodes" / type_dir, root / "nodes" / ntype]:
+        f = ndir / f"{slug}.md"
+        if f.exists():
+            return f
+
+    # Scan directory for frontmatter id match (handles t-XXX-description.md pattern)
+    import yaml
+    for ndir in [root / "nodes" / type_dir, root / "nodes" / ntype]:
+        if not ndir.is_dir():
+            continue
+        for nf in ndir.glob("*.md"):
+            try:
+                text = nf.read_text()
+                if text.startswith("---"):
+                    fm_text = text.split("---", 2)[1]
+                    fm = yaml.safe_load(fm_text) or {}
+                    if fm.get("id") == node_id:
+                        return nf
+            except Exception:
+                continue
     return None
 
 
-def _append_verdict_to_node(node_file: Path, verdict: str, confidence: float, notes: str) -> None:
+def _claim_node(root: Path, node_id: str, session_id: str, force: bool = False) -> tuple[bool, str]:
+    """
+    Atomically claim a node for a session. Returns (success, message).
+    Uses fcntl.flock for inter-process mutual exclusion.
+    """
+    import fcntl
+    node_file = _find_node_file(root, node_id)
+    if not node_file or not node_file.exists():
+        return False, f"node not found: {node_id}"
+
+    import yaml
+    lock_file = node_file.with_suffix(".lock")
+
+    # Acquire exclusive lock
+    with open(lock_file, "a") as lf:
+        fcntl.flock(lf.fileno(), fcntl.LOCK_EX)
+        try:
+            content = node_file.read_text()
+            if not content.startswith("---"):
+                return False, f"no frontmatter in {node_file}"
+
+            parts = content.split("---", 2)
+            if len(parts) < 3:
+                return False, f"malformed frontmatter in {node_file}"
+            fm_text, body = parts[1], parts[2]
+
+            try:
+                fm = yaml.safe_load(fm_text) or {}
+            except Exception as e:
+                return False, f"YAML parse error: {e}"
+
+            now = int(time.time())
+
+            # Check if already claimed by someone else (skip if force=True for reclaim)
+            if fm.get("claimed_by") and fm.get("claimed_by") != session_id and not force:
+                claimed_at = fm.get("claimed_at", 0)
+                age = now - claimed_at
+                return False, (f"already claimed by {fm['claimed_by']} "
+                               f"({age}s ago)")
+
+            # Write claim
+            fm["claimed_by"] = session_id
+            fm["claimed_at"] = now
+            fm["id"] = node_id
+
+            # Serialize back to YAML
+            new_fm_lines = []
+            for k, v in fm.items():
+                new_fm_lines.append(f"{k}: {repr(v) if isinstance(v, str) else v}")
+            new_fm = "\n".join(new_fm_lines)
+            new_content = f"---\n{new_fm}\n---\n{body}"
+
+            # Atomic write: write to temp then rename
+            tmp = node_file.with_suffix(".md.tmp")
+            tmp.write_text(new_content)
+            tmp.rename(node_file)
+            return True, f"claimed {node_id} for {session_id} at {now}"
+        finally:
+            fcntl.flock(lf.fileno(), fcntl.LOCK_UN)
+
+
+def _detect_stale(root: Path, threshold_seconds: int) -> list[dict]:
+    """Scan all nodes, return list of stale claimed nodes."""
+    import yaml
+    nodes_dir = root / "nodes"
+    stale = []
+    now = int(time.time())
+    for nf in sorted(nodes_dir.rglob("*.md")):
+        try:
+            content = nf.read_text()
+            if not content.startswith("---"):
+                continue
+            parts = content.split("---", 2)
+            if len(parts) < 2:
+                continue
+            fm = yaml.safe_load(parts[1]) or {}
+            if fm.get("claimed_by") and fm.get("claimed_at"):
+                age = now - int(fm["claimed_at"])
+                if age > threshold_seconds:
+                    stale.append({
+                        "node_id": fm.get("id", nf.stem),
+                        "file": str(nf),
+                        "claimed_by": fm["claimed_by"],
+                        "claimed_at": fm["claimed_at"],
+                        "age_seconds": age,
+                    })
+        except Exception:
+            continue
+    return stale
+
+
+def cmd_claim(args: argparse.Namespace) -> int:
+    root = _find_root()
+    success, msg = _claim_node(root, args.node_id, args.session)
+    print(msg)
+    return 0 if success else 1
+
+
+def cmd_detect_stale(args: argparse.Namespace) -> int:
+    root = _find_root()
+    stale = _detect_stale(root, args.threshold_seconds)
+    if not stale:
+        print(f"no stale claims (threshold={args.threshold_seconds}s)")
+        return 0
+    for s in stale:
+        print(f"STALE node={s['node_id']} by={s['claimed_by']} age={s['age_seconds']}s")
+    return 0
+
+
+def cmd_reclaim(args: argparse.Namespace) -> int:
+    root = _find_root()
+    success, msg = _claim_node(root, args.node_id, args.session, force=True)
+    print(msg)
+    return 0 if success else 1
+
+
+def _append_verdict_to_node(node_file: Path, verdict: str, confidence: float, notes: str, next_edge: str | None = None) -> None:
     """Add verdict frontmatter fields to an existing node file."""
     content = node_file.read_text()
     if "---" not in content:
@@ -198,9 +329,11 @@ def _append_verdict_to_node(node_file: Path, verdict: str, confidence: float, no
     # Add verdict fields to frontmatter
     fm_lines = fm.strip().splitlines()
     # Remove any existing verdict/confidence lines
-    fm_lines = [l for l in fm_lines if not l.startswith(("verdict:", "confidence:"))]
+    fm_lines = [l for l in fm_lines if not l.startswith(("verdict:", "confidence:", "next_edges:"))]
     fm_lines.append(f"verdict: {verdict}")
     fm_lines.append(f"confidence: {confidence}")
+    if next_edge:
+        fm_lines.append(f"next_edges: [{next_edge}]")
     new_fm = "---\n" + "\n".join(fm_lines) + "\n---"
     node_file.write_text(new_fm + "\n" + body)
     # Append notes to body
@@ -237,6 +370,7 @@ def main() -> int:
     p_done.add_argument("--node-id", default=None)
     p_done.add_argument("--parent", default=None)
     p_done.add_argument("--notes", default="")
+    p_done.add_argument("--next-edge", default=None)
     p_done.set_defaults(func=cmd_done)
 
     p_pend = sub.add_parser("pending")
@@ -256,6 +390,20 @@ def main() -> int:
     p_stat = sub.add_parser("status")
     p_stat.add_argument("iter_n", type=int)
     p_stat.set_defaults(func=cmd_status)
+
+    p_claim = sub.add_parser("claim")
+    p_claim.add_argument("--node-id", required=True)
+    p_claim.add_argument("--session", required=True)
+    p_claim.set_defaults(func=cmd_claim)
+
+    p_stale = sub.add_parser("detect-stale")
+    p_stale.add_argument("--threshold-seconds", type=int, default=300)
+    p_stale.set_defaults(func=cmd_detect_stale)
+
+    p_reclaim = sub.add_parser("reclaim")
+    p_reclaim.add_argument("--node-id", required=True)
+    p_reclaim.add_argument("--session", required=True)
+    p_reclaim.set_defaults(func=cmd_reclaim)
 
     args = ap.parse_args()
     return args.func(args)

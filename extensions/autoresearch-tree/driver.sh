@@ -88,23 +88,29 @@ iter_run() {
     AUTORESEARCH_TREE_PROJECT_ROOT="$PROJECT_ROOT" python3 "$RENDER_PY" "$PROJECT_ROOT/nodes" 2>&1 | tee -a "$LOG"
   fi
 
-  # 3. Emit METRIC lines
+  # 3. Emit METRICs
   emit_metrics "$n"
+
+  # 4. Pre-dispatch benchmark (attractiveness scores for transparency)
+  python3 "$PLUGIN_ROOT/bin/benchmark.py" "$PROJECT_ROOT" 2>&1 | tee -a "$LOG" || true
 
   if [[ "$SMOKE" == "true" ]]; then
     echo "[smoke] skipping agent dispatch + heal" | tee -a "$LOG"
     return
   fi
 
-  # 4. Spawn parallel pi agents w/ zoom-targeted contexts
+  # 5. Spawn parallel pi agents w/ zoom-targeted contexts
   python3 "$PLUGIN_ROOT/bin/dispatch.py" "$PROJECT_ROOT" "$n" 2>&1 | tee -a "$LOG"
 
-  # 5. Monitor + heal
+  # 6. Monitor + heal
   if [[ "$NO_HEAL" != "true" ]]; then
     python3 "$PLUGIN_ROOT/bin/heal.py" "$PROJECT_ROOT" "$n" 2>&1 | tee -a "$LOG"
   fi
 
-  # 6. Print summary
+  # 7. Post-wire: push agent verdicts back into node graph
+  python3 "$PLUGIN_ROOT/bin/post_wire.py" "$PROJECT_ROOT" "$n" 2>&1 | tee -a "$LOG" || true
+
+  # 8. Print summary
   python3 "$PLUGIN_ROOT/bin/cli.py" status "$n" 2>&1 | tee -a "$LOG" || true
 }
 

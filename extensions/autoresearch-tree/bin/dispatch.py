@@ -64,6 +64,11 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("project_root")
     ap.add_argument("iter_n", type=int)
+    ap.add_argument(
+        "--template",
+        default=None,
+        help="Override pipeline_template from config (e.g. 'research', 'builder-first')",
+    )
     args = ap.parse_args()
 
     root = Path(args.project_root).resolve()
@@ -76,21 +81,36 @@ def main() -> int:
     n = int(cfg.get("agent_dispatch", {}).get("claude_max_parallel", 1))
     big_split = float(cfg.get("big_idea_vs_small_idea_split", 0.3))
     timeout_min = int(cfg.get("agent_timeout_mins", 10))
+    pipeline_template = args.template or cfg.get("pipeline_template")
 
     iter_dir = root / "sessions" / f"iter-{args.iter_n:03d}"
     iter_dir.mkdir(parents=True, exist_ok=True)
 
-    # Pick zoom level + target per agent.
-    targets = _pick_targets(root, n)
+    # Two-agent research pipeline: architect (slot 0) + builder (slot 1)
+    # Slot 1 waits for slot 0 to produce a node, then implements it.
+    if pipeline_template == "research" and n < 2:
+        print(f"ERR: pipeline_template=research requires claude_max_parallel>=2, got {n}", file=sys.stderr)
+        return 1
+
+    if pipeline_template == "research":
+        targets = _research_pipeline_targets(root, n, iter_dir)
+    else:
+        targets = _pick_targets(root, n)
 
     manifest = {
         "iter": args.iter_n,
         "started_at": int(time.time()),
         "timeout_seconds": timeout_min * 60,
         "agents": [],
+        "pipeline_template": pipeline_template,
     }
 
-    for slot, (level, target) in enumerate(targets):
+    for slot, target_entry in enumerate(targets):
+        if len(target_entry) == 4:
+            level, target, strategy, role = target_entry
+        else:
+            level, target, strategy = target_entry
+            role = None
         # Decide big-vs-small based on config split when "auto"
         if level == "auto":
             level = "big" if random.random() < big_split else "small"
@@ -108,7 +128,7 @@ def main() -> int:
         ctx_path = subprocess.run(zoom_cmd, capture_output=True, text=True, check=True).stdout.strip()
 
         # Scaffold a node file before agent starts — agent fills body only
-        scaffold_info = _scaffold_node_for_agent(root, args.iter_n, agent_id, level, target)
+        scaffold_info = _scaffold_node_for_agent(root, args.iter_n, agent_id, level, target, role)
         if scaffold_info:
             print(f"scaffolded {scaffold_info['node_type']} node: {scaffold_info['node_id']}")
 
@@ -130,6 +150,8 @@ def main() -> int:
             "slot": slot,
             "level": level,
             "target": target,
+            "strategy": strategy,
+            "role": role,
             "pid": proc.pid,
             "started_at": int(time.time()),
             "status": "running",
@@ -139,52 +161,246 @@ def main() -> int:
         }
         (sess_dir / "agent.json").write_text(json.dumps(agent_record, indent=2))
         manifest["agents"].append(agent_record)
-        print(f"spawned {agent_id} pid={proc.pid} level={level} target={target or '-'}")
+        print(f"spawned {agent_id} pid={proc.pid} level={level} target={target or '-'} strategy={strategy}")
 
     (iter_dir / "manifest.json").write_text(json.dumps(manifest, indent=2))
     print(f"manifest: {iter_dir / 'manifest.json'}")
     return 0
 
 
-def _pick_targets(root: Path, n: int) -> list[tuple[str, str | None]]:
-    """Choose (zoom_level, target_node_id) for each of N slots.
+def _research_pipeline_targets(root: Path, n: int, iter_dir: Path) -> list[tuple[str, str | None, str]]:
+    """Two-agent pipeline: slot 0 = research, slot 1 = implementation.
 
-    Strategy v1:
-    - 1st slot: big idea (always — broad exploration)
-    - rest:    small idea targeting top-attractor chains (highest descendant count)
+    Both agents work on the SAME parent node in parallel:
+    - Slot 0 (research): extends parent hypothesis → creates experiment → verdict
+    - Slot 1 (implementation): extends SAME parent hypothesis → creates mvp pseudocode
 
-    Returns list of (level, target_id_or_None).
+    After both complete, post_wire handles wiring both children to the parent.
+
+    Returns list of (level, target, strategy, role).
     """
-    out: list[tuple[str, str | None]] = []
-    out.append(("big", None))
+    import sys as _sys
+    plugin_root = Path(__file__).resolve().parent.parent
+    proj_src = root / "src"
+    if (proj_src / "graph_core").is_dir():
+        _sys.path.insert(0, str(proj_src))
+    _sys.path.insert(0, str(plugin_root / "src"))
+
+    from graph_core.loader import load_directory
+    from graph_core.edge import Edge
+    from collections import defaultdict
+
+    # Load closed chains
+    closed_chains: set[str] = set()
+    ccf = root / "closed_chains.txt"
+    if ccf.exists():
+        for line in ccf.read_text().splitlines():
+            if line := line.strip():
+                closed_chains.add(line)
+
+    # Build graph
+    g, loaded = load_directory(root / "nodes")
+    for ln in loaded:
+        for parent_id in ln.node.parents:
+            if g.has_node(parent_id):
+                try:
+                    g.add_edge(Edge(source_id=parent_id, target_id=ln.node.id, relation="spawns"))
+                except Exception:
+                    pass
+                pn = g.get_node(parent_id)
+                if pn is not None:
+                    pn.children.add(ln.node.id)
+
+    # Find best hypothesis node (closed-chain filtered)
+    hypothesis_nodes = [
+        nid for nid in g.node_ids
+        if nid not in closed_chains
+        and g.get_node(nid) is not None
+        and g.get_node(nid).type in ("hypothesis", "Hypothesis")
+    ]
+
+    if not hypothesis_nodes:
+        # Fallback: any non-closed node
+        candidates = [nid for nid in g.node_ids if nid not in closed_chains]
+        if not candidates:
+            return [("big", None, "explore_new", "research")]
+        parent = candidates[0]
+    else:
+        # Score by descendant count (more children = more active chain)
+        def _score(nid):
+            n = g.get_node(nid)
+            if n is None:
+                return 0
+            # Prefer nodes with experiment children (active chain)
+            has_exp = any(
+                g.get_node(c).type in ("experiment", "Experiment")
+                for c in (n.children or [])
+                if g.get_node(c) is not None
+            )
+            return (10 if has_exp else 0) + len(n.children or [])
+
+        hypothesis_nodes.sort(key=_score, reverse=True)
+        parent = hypothesis_nodes[0]
+
+    # Slot 0: research agent extends parent → experiment/verdict
+    # Slot 1: implementation agent extends SAME parent → mvp pseudocode
+    # Both use "small" zoom on the same target
+    result = [
+        ("small", parent, "extend_existing", "research"),
+    ]
+    if n >= 2:
+        result.append(("small", parent, "extend_existing", "implementation"))
+
+    return result
+
+
+def _pick_targets(root: Path, n: int) -> list[tuple[str, str | None, str]]:
+    """Choose (zoom_level, target_node_id, strategy) for each of N slots.
+
+    Attractiveness-based chain picking v2:
+    - Loads the node graph directly (not just INJECTION.md)
+    - Scores chains by: descendant count + recency bonus + type diversity
+    - Three branching strategies: explore_new | extend_existing | branch_fork
+    - Two-agent pipeline: architect (big) + builder (small)
+
+    Returns list of (level, target_id_or_None, strategy).
+    """
+    import sys as _sys
+    plugin_root = Path(__file__).resolve().parent.parent
+    proj_src = root / "src"
+    if (proj_src / "graph_core").is_dir():
+        _sys.path.insert(0, str(proj_src))
+    _sys.path.insert(0, str(plugin_root / "src"))
+
+    from collections import defaultdict
+    from graph_core.loader import load_directory
+    from graph_core.edge import Edge
+
+    out: list[tuple[str, str | None, str]] = []
+
+    # --- Load closed chains ---
+    closed_chains: set[str] = set()
+    closed_chains_file = root / "closed_chains.txt"
+    if closed_chains_file.exists():
+        for line in closed_chains_file.read_text().splitlines():
+            if line := line.strip():
+                closed_chains.add(line)
+
+    # --- Build graph ---
+    g, loaded = load_directory(root / "nodes")
+    for ln in loaded:
+        for parent_id in ln.node.parents:
+            if g.has_node(parent_id):
+                try:
+                    g.add_edge(Edge(source_id=parent_id, target_id=ln.node.id, relation="spawns"))
+                except Exception:
+                    pass
+                pn = g.get_node(parent_id)
+                if pn is not None:
+                    pn.children.add(ln.node.id)
+
+    # --- Compute attractiveness scores ---
+    # Score = weighted_descendants * recency_boost * type_diversity_bonus
+    scores: dict[str, float] = {}
+
+    def _descendant_count(node_id: str, seen: set[str] | None = None) -> int:
+        if seen is None:
+            seen = set()
+        if node_id in seen:
+            return 0
+        seen.add(node_id)
+        n = g.get_node(node_id)
+        if n is None or not n.children:
+            return 0
+        return 1 + sum(_descendant_count(c, seen) for c in n.children if c != node_id)
+
+    def _type_diversity(node_id: str, seen: set[str] | None = None) -> float:
+        """Types in subtree / total types. Normalized diversity bonus."""
+        if seen is None:
+            seen = set()
+        if node_id in seen:
+            return 0.0
+        seen.add(node_id)
+        n = g.get_node(node_id)
+        if n is None:
+            return 0.0
+        types = {n.type}
+        for c in (n.children or []):
+            if c != node_id:
+                types |= {_type_diversity(c, seen) > 0}  # just presence flag
+        # Simple: count unique types in subtree
+        sub_types: set[str] = set()
+        stack = [node_id]
+        while stack:
+            cid = stack.pop()
+            if cid in seen:
+                continue
+            seen.add(cid)
+            cn = g.get_node(cid)
+            if cn:
+                sub_types.add(cn.type)
+                stack.extend(cn.children or [])
+        return len(sub_types) / max(len(list(g.nodes)), 1)
+
+    for node_id in g.node_ids:
+        desc = _descendant_count(node_id)
+        node = g.get_node(node_id)
+        # Recency: leaf nodes with no children get a small boost (untested = potential)
+        recency_boost = 1.2 if (node and not node.children) else 1.0
+        diversity = _type_diversity(node_id)
+        # Type weighting: hypothesis and experiment are high-value chain starts
+        type_weight = {"hypothesis": 1.4, "experiment": 1.2, "verdict": 1.1}.get(
+            node.type if node else "", 1.0
+        )
+        scores[node_id] = desc * recency_boost * type_weight * (1.0 + 0.1 * diversity)
+
+    # Sort nodes by attractiveness (descending)
+    ranked = sorted(scores.items(), key=lambda x: x[1], reverse=True)
+
+    # --- Determine branching strategy per slot ---
+    def _pick_strategy(idx: int, total: int) -> str:
+        """Decide strategy based on position in the dispatch batch."""
+        if idx == 0:
+            return "explore_new"  # Always start with fresh exploration
+        if idx <= total * 0.3:
+            return "extend_existing"  # First 30%: extend best chains
+        if idx <= total * 0.6:
+            return "branch_fork"  # Next 30%: fork from a mid-ranked chain
+        return "explore_new"  # Final 30%: fresh exploration
+
+    # --- Build target list ---
+    # Slot 0: big/explore_new (architect agent)
+    out.append(("big", None, "explore_new"))
+
     if n <= 1:
         return out
-    # Pull top attractors from INJECTION.md
-    inject = (root / "context" / "INJECTION.md").read_text(encoding="utf-8")
-    targets: list[str] = []
-    in_block = False
-    for line in inject.splitlines():
-        if line.startswith("## attractive ideas"):
-            in_block = True
-            continue
-        if in_block and line.startswith("## "):
-            break
-        if in_block and line.lstrip().startswith("- "):
-            # `- idea:foo :: K descendants`
-            payload = line.lstrip()[2:].split(" :: ")[0].strip()
-            if payload:
-                targets.append(payload)
+
+    # Gather candidates by strategy, excluding closed chains
+    extend_candidates = [nid for nid, _score in ranked if nid not in closed_chains and g.get_node(nid) and not g.get_node(nid).is_leaf][:5]
+    fork_candidates = [nid for nid, _score in ranked if nid not in closed_chains and g.get_node(nid) and g.get_node(nid).children][:8]
+
     while len(out) < n:
-        if targets:
-            t = targets[(len(out) - 1) % len(targets)]
-            out.append(("small", t))
+        strategy = _pick_strategy(len(out), n)
+
+        if strategy == "extend_existing":
+            candidates = extend_candidates
+        elif strategy == "branch_fork":
+            candidates = fork_candidates
         else:
-            out.append(("big", None))
+            candidates = [nid for nid, _ in ranked[:10] if nid not in closed_chains]
+
+        if candidates:
+            # Round-robin through candidates to spread agents across chains
+            t = candidates[(len(out) - 1) % len(candidates)]
+            out.append(("small", t, strategy))
+        else:
+            out.append(("big", None, "explore_new"))
+
     return out
 
 
 def _scaffold_node_for_agent(
-    root: Path, iter_n: int, agent_id: str, level: str, target: str | None
+    root: Path, iter_n: int, agent_id: str, level: str, target: str | None, role: str | None = None
 ) -> dict | None:
     """Decide what node type to scaffold and pre-create the file skeleton.
 
@@ -194,8 +410,12 @@ def _scaffold_node_for_agent(
 
     NODE_TYPES = ("hypothesis", "experiment", "verdict", "mvp", "outcome", "bigger-outcome", "app-purpose")
 
-    # Pick node type: big=idea→hyp, small=extend existing chain
-    if level == "big":
+    # Pick node type based on target type, or override via role
+    if role == "research":
+        node_type = "experiment"
+    elif role == "implementation":
+        node_type = "mvp"
+    elif level == "big":
         node_type = "hypothesis"
     else:
         # small zoom: extend from target — decide step based on target type
