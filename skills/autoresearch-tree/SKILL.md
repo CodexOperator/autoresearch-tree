@@ -62,6 +62,108 @@ Override project root explicitly:
 AUTORESEARCH_TREE_PROJECT_ROOT=/path/to/project autoresearch-tree --smoke
 ```
 
+### Recommended: launch inside tmux
+
+For multi-hour runs you want to monitor across sessions, launch the loop in
+a detached tmux session and a sibling monitor session:
+
+```bash
+cd <project>
+# Worker session — runs the actual loop. Detached (-d), no terminal needed.
+tmux new-session -d -s autoresearch-tree \
+  "autoresearch-tree --max-iters 25 --delay-mins 2 |& tee /tmp/autoresearch-tree.log"
+
+# Optional monitor session — split log tail + sessions/git watcher.
+tmux new-session -d -s autoresearch-monitor -x 220 -y 50 \
+  "tail -f /tmp/autoresearch-tree.log"
+tmux split-window -h -t autoresearch-monitor \
+  "watch -n 5 'ls -t <project>/sessions/ | head -10; echo ---; cd <project> && git log --oneline | head -10'"
+```
+
+Attach to either from anywhere:
+
+```bash
+tmux attach -t autoresearch-tree    # see live driver output, Ctrl-B D to detach
+tmux attach -t autoresearch-monitor # see split log+session+git view
+```
+
+This survives shell exit, supports re-attach from any future shell, and lets
+you peek without disturbing the loop. The worker session itself is fully
+disposable — kill it with `tmux kill-session -t autoresearch-tree` to stop
+gracefully (heal.py will SIGTERM agents, then SIGKILL).
+
+### Fully detached (no tmux, fire and forget)
+
+If tmux is unavailable, use `setsid` + `nohup` so the loop survives any
+shell exit:
+
+```bash
+cd <project>
+setsid nohup bash -c \
+  'autoresearch-tree --max-iters 25 --delay-mins 2 > /tmp/autoresearch-tree.log 2>&1' \
+  </dev/null >/dev/null 2>&1 &
+disown
+```
+
+Tradeoff: there's no PTY to attach to — only the log file and the per-agent
+session dirs to watch. If you may want to interact with the run later, prefer
+tmux.
+
+### Monitoring a live run
+
+The driver writes:
+
+- **Loop log:** stdout/stderr — METRIC lines, spawn events, iter summaries
+- **Per-iter manifest:** `<project>/sessions/iter-NNN/manifest.json` — agent
+  ids, pids, status, verdicts
+- **Per-agent log:** `<project>/sessions/iter-NNN/<agent_id>/output.log`
+- **Per-agent state:** `<project>/sessions/iter-NNN/<agent_id>/agent.json`
+  (status: running/done/failed, verdict, confidence)
+- **Commits:** agents commit to project git when work is done — `git log` is
+  the authoritative record of what was produced
+- **Injection:** `<project>/context/INJECTION.md` re-rendered every iter
+
+Useful one-liners:
+
+```bash
+# Live loop progress
+tail -f /tmp/autoresearch-tree.log
+
+# Iter status across the project
+grep -E "iter [0-9]+: 5 agents|status=" /tmp/autoresearch-tree.log
+
+# How far along
+ls <project>/sessions/ | grep -E "^iter-[0-9]+$" | sort -V | tail -5
+
+# Verdict tally for the latest iter
+python3 -c "import json; m=json.load(open('<project>/sessions/iter-NNN/manifest.json')); \
+  [print(f\"{a['id']}: {a['status']} verdict={a.get('verdict','-')}\") for a in m['agents']]"
+
+# What the agents committed
+cd <project> && git log --oneline -20
+
+# Kill the run if needed
+pkill -f "autoresearch-tree --max-iters"
+# or, if launched in tmux:
+tmux kill-session -t autoresearch-tree
+```
+
+### Iter numbering caveat
+
+The driver always runs `iter-001` through `iter-N` regardless of prior state.
+Re-running over an existing project clobbers the per-agent session dirs
+(`sessions/iter-NNN/`), but the actual research output (verdicts, nodes,
+commits) is preserved in `nodes/` and git. To preserve session logs across
+re-runs, archive the prior `sessions/iter-NNN/` dirs first:
+
+```bash
+for d in <project>/sessions/iter-0*; do
+  mv "$d" "${d}-prevrun-$(date +%s)"
+done
+```
+
+A future driver flag (`--iter-base`) would lift this constraint.
+
 ### From inside pi (skill)
 
 When this skill is loaded, the pi agent invokes the same CLI via Bash:
