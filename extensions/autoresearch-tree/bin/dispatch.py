@@ -107,8 +107,13 @@ def main() -> int:
             zoom_cmd.extend(["--target", target])
         ctx_path = subprocess.run(zoom_cmd, capture_output=True, text=True, check=True).stdout.strip()
 
+        # Scaffold a node file before agent starts — agent fills body only
+        scaffold_info = _scaffold_node_for_agent(root, args.iter_n, agent_id, level, target)
+        if scaffold_info:
+            print(f"scaffolded {scaffold_info['node_type']} node: {scaffold_info['node_id']}")
+
         # Spawn pi (detached). Output -> sess_dir/output.log
-        pi_args = _build_pi_args(cfg, ctx_path, agent_id, args.iter_n, sess_dir)
+        pi_args = _build_pi_args(cfg, ctx_path, agent_id, args.iter_n, sess_dir, scaffold_info)
         log_file = sess_dir / "output.log"
         with open(log_file, "wb") as logf:
             proc = subprocess.Popen(
@@ -178,28 +183,116 @@ def _pick_targets(root: Path, n: int) -> list[tuple[str, str | None]]:
     return out
 
 
+def _scaffold_node_for_agent(
+    root: Path, iter_n: int, agent_id: str, level: str, target: str | None
+) -> dict | None:
+    """Decide what node type to scaffold and pre-create the file skeleton.
+
+    Returns a dict with node_type, node_id, parent, slug or None if nothing to scaffold.
+    """
+    import uuid
+
+    NODE_TYPES = ("hypothesis", "experiment", "verdict", "mvp", "outcome", "bigger-outcome", "app-purpose")
+
+    # Pick node type: big=idea→hyp, small=extend existing chain
+    if level == "big":
+        node_type = "hypothesis"
+    else:
+        # small zoom: extend from target — decide step based on target type
+        if target:
+            if target.startswith("hypothesis:"):
+                node_type = "experiment"
+            elif target.startswith("experiment:"):
+                node_type = "verdict"
+            elif target.startswith("verdict:"):
+                node_type = "mvp"
+            elif target.startswith("mvp:"):
+                node_type = "outcome"
+            elif target.startswith("outcome:"):
+                node_type = "bigger-outcome"
+            else:
+                node_type = "hypothesis"
+        else:
+            node_type = "hypothesis"
+
+    # Generate slug
+    slug = f"{agent_id}-{(uuid.uuid4().hex[:6])}"
+    node_id = f"{node_type}:{slug}"
+    parent = target or ""
+
+    # Write the scaffold file
+    type_dir = node_type.replace("-", "_")
+    node_dir = root / "nodes" / type_dir
+    node_dir.mkdir(parents=True, exist_ok=True)
+    node_file = node_dir / f"{slug}.md"
+
+    if node_file.exists():
+        return None
+
+    prompts = {
+        "hypothesis": "## Hypothesis\n\nWhat is the testable claim?\nWhat would prove it? What would disprove it?\n\n",
+        "experiment": "## Experiment\n\nWhat did you do? What happened?\nInclude command/inputs and actual outputs.\n\n## Evidence\n\nRaw output, logs.\n\n",
+        "verdict": "## Verdict\n\nproved | disproved | inconclusive_lean_proved:N | inconclusive_lean_disproved:N\n\n## Evidence\n\nWhat supports this?\n\n## Confidence\n\n0.0 – 1.0\n\n",
+        "mvp": "## MVP\n\nWhat does this do?\n\n## Inputs\n\nWhat does it take?\n\n## Outputs\n\nWhat does it produce?\n\n",
+        "outcome": "## Outcome\n\nInput shape:\n\nOutput shape:\n\nBehavior:\n\nEdge cases:\n\n",
+        "bigger-outcome": "## Bigger Outcome\n\nWhat purpose does this serve?\n\n",
+        "app-purpose": "## App Purpose\n\nTop-level mission?\n\n",
+    }
+
+    body = prompts.get(node_type, "")
+    fm = [
+        "---",
+        f"id: {node_id}",
+        f"type: {node_type}",
+        f"parents:\n  - {parent}",
+        "next_edges: []",
+        "---",
+        "",
+        f"# {node_id}",
+        "",
+    ]
+    node_file.write_text("\n".join(fm) + body)
+    return {"node_type": node_type, "node_id": node_id, "parent": parent, "slug": slug, "path": str(node_file)}
+
+
 def _build_pi_args(
     cfg: dict,
     context_file: str,
     agent_id: str,
     iter_n: int,
     sess_dir: Path,
+    scaffold_info: dict | None = None,
 ) -> list[str]:
     dispatch_cfg = cfg.get("agent_dispatch", {})
     pi_bin = os.environ.get("PI_BIN", "/home/ubuntu/.npm-global/bin/pi")
-    # Provider/model intentionally NOT passed: pi uses its own default agent
-    # config (~/.pi/agent/settings.json). Wall-clock cap enforced by heal.py
-    # via agent_timeout_mins (SIGTERM/SIGKILL on overrun).
     args = [
         pi_bin,
         "--append-system-prompt", f"@{context_file}",
         "--append-system-prompt", (
             f"You are agent {agent_id} on iteration {iter_n}. "
-            f"When complete, run: python3 {CLI_PY} done {iter_n} {agent_id} "
-            f"--verdict <state> --confidence <0..1> --node-id <id>. "
-            f"Stay within zoom scope; do NOT wander."
+            f"Your job: fill in the scaffolded node file below, then signal done."
         ),
     ]
+    if scaffold_info:
+        args.extend([
+            "--append-system-prompt", (
+                f"SCAFFOLDED NODE FILE: {scaffold_info['path']}\n"
+                f"Node type: {scaffold_info['node_type']}  "
+                f"Node ID: {scaffold_info['node_id']}  "
+                f"Parent: {scaffold_info['parent']}\n"
+                f"FILL IN the body of that file. Do NOT rewrite frontmatter.\n"
+                f"When done, run: python3 {CLI_PY} done {iter_n} {agent_id} "
+                f"--verdict <state> --confidence <0..1> --node-id {scaffold_info['node_id']} "
+                f"--parent {scaffold_info['parent']}"
+            ),
+        ])
+    else:
+        args.extend([
+            "--append-system-prompt", (
+                f"When complete, run: python3 {CLI_PY} done {iter_n} {agent_id} "
+                f"--verdict <state> --confidence <0..1> --node-id <id> --parent <parent>"
+            ),
+        ])
     # Allow extra prompt-from-skill
     skill_prompt = (PLUGIN_ROOT / "lib" / "agent-prompt.md")
     if skill_prompt.exists():
