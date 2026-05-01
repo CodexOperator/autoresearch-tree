@@ -110,11 +110,17 @@ iter_run() {
 
 emit_metrics() {
   local iter_n="$1"
-  PROJECT_ROOT="$PROJECT_ROOT" python3 - <<PYEOF | tee -a "$LOG"
+  PROJECT_ROOT="$PROJECT_ROOT" PLUGIN_ROOT="$PLUGIN_ROOT" python3 - <<PYEOF | tee -a "$LOG"
 import os, sys
 from pathlib import Path
 root = Path(os.environ["PROJECT_ROOT"])
-sys.path.insert(0, str(root / "src"))
+plugin_root = Path(os.environ["PLUGIN_ROOT"])
+# Engine modules live in plugin's src/ (post-migration). Project's src/ wins
+# if present, so projects can override engine modules locally.
+proj_src = root / "src"
+if (proj_src / "graph_core").is_dir():
+    sys.path.insert(0, str(proj_src))
+sys.path.insert(0, str(plugin_root / "src"))
 from collections import defaultdict
 from graph_core.loader import load_directory
 from graph_core.edge import Edge
