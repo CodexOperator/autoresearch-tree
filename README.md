@@ -9,7 +9,7 @@ Capillary DAG memory for fast LLM agent onboarding. A pi extension + skill that:
 ## Install
 
 ```bash
-pi install git:github.com/USER/autoresearch-tree
+pi install git:github.com/CodexOperator/autoresearch-tree
 ```
 
 This registers the extension and skill via pi's standard `package.json` discovery (`pi.extensions` + `pi.skills`).
@@ -17,7 +17,7 @@ This registers the extension and skill via pi's standard `package.json` discover
 You can also install locally for development:
 
 ```bash
-git clone https://github.com/USER/autoresearch-tree ~/autoresearch-tree
+git clone https://github.com/CodexOperator/autoresearch-tree ~/autoresearch-tree
 ln -sf ~/autoresearch-tree/extensions/autoresearch-tree/driver.sh ~/.local/bin/autoresearch-tree
 ```
 
